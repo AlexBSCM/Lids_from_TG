@@ -1,11 +1,12 @@
 """
-BanditTour Lead Scanner Bot (real-time + inline buttons).
+BanditTour Lead Scanner Bot (hybrid: user-account + bot-account).
 
-Перед запуском:
-1. Заполнить test_config.json (bot_token, notify_chat_id)
-2. Запустить: python bot.py
-3. Авторизоваться по телефону+коду (первый раз)
-4. Открыть бота в Telegram, отправить /start
+User-account (session_user.session):
+- Слушает новые сообщения в подключённых каналах через Telethon events
+
+Bot-account (session_bot.session):
+- Принимает /start, /stats, /leads и inline-кнопки
+- Отправляет уведомления вам в личку
 """
 
 import asyncio
@@ -28,7 +29,8 @@ BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "test_config.json"
 OUTPUT_PATH = BASE_DIR / "matches_found.json"
 STATE_PATH = BASE_DIR / "scan_state.json"
-SESSION_NAME = str(BASE_DIR / "session")
+SESSION_USER = str(BASE_DIR / "session_user")
+SESSION_BOT = str(BASE_DIR / "session_bot")
 LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 LOG_PATH = LOG_DIR / "bot.log"
@@ -46,16 +48,6 @@ log = logging.getLogger("bot")
 
 def load_config():
     return json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
-
-
-def load_state():
-    if STATE_PATH.exists():
-        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
-    return {}
-
-
-def save_state(state):
-    STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def load_leads():
@@ -92,15 +84,11 @@ def text_matches(text, patterns):
 CLASSIFY_PROMPT = """Ты — ассистент, который отбирает лиды для турфирмы BanditTour.
 
 ГЕОГРАФИЯ: нас интересует ТОЛЬКО север Таиланда:
-- Чиангмай (Chiang Mai)
-- Чианграй (Chiang Rai)
-- Пай (Pai)
-- Золотой треугольник (Golden Triangle)
-- Мэхонгсон (Mae Hong Son)
+- Чиангмай (Chiang Mai), Чианграй (Chiang Rai), Пай (Pai)
+- Золотой треугольник (Golden Triangle), Мэхонгсон (Mae Hong Son)
 
 ИСКЛЮЧЕНИЯ (это НЕ лиды, категория noise):
-- Паттайя (Pattaya), Бангкок (Bangkok), Пхукет (Phuket), Самуи (Koh Samui),
-  Краби (Krabi), Хуахин (Hua Hin), Ко Самет, Пханган
+- Паттайя, Бангкок, Пхукет, Самуи, Краби, Хуахин, Ко Самет, Пханган
 - любые другие регионы Таиланда вне севера
 
 КАТЕГОРИИ:
@@ -128,7 +116,6 @@ def init_gemini(api_key, model_name):
 def classify_message(model, text, max_retries=3):
     if not text or len(text.strip()) < 10:
         return {"is_lead": False, "category": "noise", "reason": "слишком короткое"}
-
     prompt = CLASSIFY_PROMPT.format(message=text[:1500])
     for attempt in range(max_retries):
         try:
@@ -162,8 +149,6 @@ def classify_message(model, text, max_retries=3):
                 return {"is_lead": False, "category": "rate_limited", "reason": "лимит Gemini"}
             return {"is_lead": False, "category": "error", "reason": f"{type(e).__name__}: {msg[:100]}"}
     return {"is_lead": False, "category": "error", "reason": "все попытки исчерпаны"}
-
-
 class BotState:
     def __init__(self):
         self.config = load_config()
@@ -171,11 +156,9 @@ class BotState:
         self.gemini = init_gemini(self.config["gemini_api_key"], self.config.get("gemini_model", "gemini-2.5-flash-lite"))
         self.leads = load_leads()
         self.known_ids = {x["id"] for x in self.leads}
-        self.state = load_state()
         self.is_listening = True
         self.stats_today = {"hot": 0, "warm": 0, "spam": 0, "noise": 0, "rate_limited": 0, "error": 0}
         self.stats_total = dict(self.stats_today)
-        self.scan_in_progress = False
 
     def is_lead_known(self, msg_id):
         return msg_id in self.known_ids
@@ -192,7 +175,8 @@ class BotState:
 
 
 bs = None
-
+bot_client = None
+notify_chat_id = None
 
 CATEGORY_EMOJI = {"hot": "🔥", "warm": "🌤", "spam": "🗑", "noise": "❌"}
 
@@ -212,7 +196,8 @@ NOTIFY_TEMPLATE = """🎯 НОВЫЙ ЛИД — BanditTour
 🔗 Ссылка: {link}"""
 
 
-async def send_notification(client, lead):
+async def send_notification(lead):
+    """Отправляет уведомление через bot-аккаунт."""
     try:
         text = NOTIFY_TEMPLATE.format(
             channel=lead.get("channel_title", lead.get("channel", "?")),
@@ -225,20 +210,18 @@ async def send_notification(client, lead):
             text=lead.get("text", "")[:1500],
             link=f"https://t.me/{lead.get('channel', '').lstrip('@')}/{lead.get('id', '')}",
         )
-        chat_id = bs.config.get("notify_chat_id")
-        if chat_id:
-            await client.send_message(int(chat_id), text, link_preview=False)
-        else:
-            await client.send_message("me", text, link_preview=False)
+        await bot_client.send_message(int(notify_chat_id), text, link_preview=False)
         return True
     except Exception as e:
         log.error(f"Ошибка отправки уведомления: {type(e).__name__}: {e}")
         return False
 
 
-async def process_new_message(client, event):
+async def process_new_message(event):
+    """Обработчик нового сообщения в канале (через user-аккаунт)."""
     if not bs.is_listening:
         return
+
     msg = event.message
     text = msg.message or ""
     if not text_matches(text, bs.patterns):
@@ -275,13 +258,11 @@ async def process_new_message(client, event):
             "classified_at": datetime.now(timezone.utc).isoformat(),
         }
         bs.add_lead(lead)
-        await send_notification(client, lead)
-
-
+        await send_notification(lead)
 def main_menu_buttons():
     buttons = [
         [Button.inline("📊 Статистика", b"stats")],
-        [Button.inline("📋 Последние лиды", b"leads"), Button.inline("🔄 Сканировать", b"scan")],
+        [Button.inline("📋 Последние лиды", b"leads")],
         [Button.inline("📡 Статус слушателя", b"listener_status")],
     ]
     if bs.is_listening:
@@ -292,9 +273,9 @@ def main_menu_buttons():
     return buttons
 
 
-async def send_main_menu(client, chat_id):
+async def send_main_menu(chat_id):
     text = "🤖 **BanditTour Lead Scanner**\n\nГлавное меню — выберите действие:"
-    await client.send_message(chat_id, text, buttons=main_menu_buttons(), parse_mode="md")
+    await bot_client.send_message(chat_id, text, buttons=main_menu_buttons(), parse_mode="md")
 
 
 async def cmd_stats(event):
@@ -360,24 +341,21 @@ async def cmd_help(event):
 • `/start` — главное меню
 • `/stats` — статистика
 • `/leads` — последние 10 лидов
-• `/scan` — ручной скан
 • `/pause` / `/resume` — управление слушателем
 
 **Что делает бот:**
-🎧 Слушает новые сообщения в каналах
+🎧 User-аккаунт слушает каналы
 🔍 Фильтрует по keywords (34+ слов)
 🤖 Классифицирует через Gemini (только север Таиланда)
-🎯 Присылает уведомления о новых лидах
+🎯 Bot-аккаунт присылает уведомления о новых лидах
 
 **Файлы:**
 • `matches_found.json` — все лиды
-• `scan_state.json` — состояние
 • `logs/bot.log` — логи"""
     await event.edit(text, parse_mode="md", buttons=[Button.inline("◀️ Назад", b"menu")])
-
-
 async def main():
-    global bs
+    global bs, bot_client, notify_chat_id
+
     config = load_config()
     api_id = config["api_id"]
     api_hash = config["api_hash"]
@@ -387,39 +365,48 @@ async def main():
 
     if not bot_token or not notify_chat_id:
         log.error("bot_token или notify_chat_id не заданы в test_config.json!")
-        log.error("Добавьте эти поля в конфиг. См. config.example.json")
         sys.exit(1)
 
     bs = BotState()
 
-    client = TelegramClient(SESSION_NAME, api_id, api_hash)
-    await client.start(bot_token=bot_token)
+    # 1) User-клиент — слушает каналы
+    user_client = TelegramClient(SESSION_USER, api_id, api_hash)
+    log.info("Авторизация user-аккаунта...")
+    await user_client.start()
+    me_user = await user_client.get_me()
+    log.info(f"✓ User: @{me_user.username} (id={me_user.id})")
 
-    me = await client.get_me()
-    log.info(f"Бот запущен как @{me.username} (id={me.id})")
+    # 2) Bot-клиент — принимает команды и отправляет уведомления
+    bot_client = TelegramClient(SESSION_BOT, api_id, api_hash)
+    log.info("Авторизация bot-аккаунта...")
+    await bot_client.start(bot_token=bot_token)
+    me_bot = await bot_client.get_me()
+    log.info(f"✓ Bot: @{me_bot.username} (id={me_bot.id})")
 
+    # 3) Подписываем user-клиент на новые сообщения в каналах
     for channel in channels:
         try:
-            entity = await client.get_entity(channel)
+            entity = await user_client.get_entity(channel)
             title = getattr(entity, "title", channel)
             log.info(f"🎧 Слушаю канал: {title} ({channel})")
-
-            @client.on(events.NewMessage(chats=entity))
-            async def handler(event):
-                await process_new_message(client, event)
         except Exception as e:
-            log.error(f"Не удалось подписаться на {channel}: {e}")
+            log.error(f"Не удалось получить {channel}: {e}")
 
-    @client.on(events.NewMessage(pattern="/start"))
+    @user_client.on(events.NewMessage(chats=channels))
+    async def channel_handler(event):
+        await process_new_message(event)
+
+    # 4) Регистрируем команды для bot-клиента
+    @bot_client.on(events.NewMessage(pattern="/start"))
     async def start_handler(event):
         if event.is_private:
-            await send_main_menu(client, event.chat_id)
+            await send_main_menu(event.chat_id)
 
-    @client.on(events.CallbackQuery)
+    @bot_client.on(events.CallbackQuery)
     async def callback_handler(event):
         data = event.data.decode("utf-8")
         if data == "menu":
-            await send_main_menu(client, event.chat_id)
+            await send_main_menu(event.chat_id)
             await event.answer()
         elif data == "stats":
             await cmd_stats(event)
@@ -443,6 +430,7 @@ async def main():
     log.info("✅ Бот готов. Нажмите Ctrl+C для остановки.")
     log.info(f"📝 Логи: {LOG_PATH}")
 
+    # 5) Отправляем стартовое сообщение через bot-аккаунт
     try:
         startup_text = f"""🚀 **BanditTour Lead Scanner запущен**
 
@@ -452,11 +440,15 @@ async def main():
 📁 Лидов в файле: {len(bs.leads)}
 
 Отправьте /start для главного меню."""
-        await client.send_message(int(notify_chat_id), startup_text, parse_mode="md")
+        await bot_client.send_message(int(notify_chat_id), startup_text, parse_mode="md")
     except Exception as e:
         log.error(f"Не удалось отправить стартовое сообщение: {e}")
 
-    await client.run_until_disconnected()
+    # 6) Запускаем оба клиента параллельно
+    await asyncio.gather(
+        user_client.run_until_disconnected(),
+        bot_client.run_until_disconnected(),
+    )
 
 
 if __name__ == "__main__":

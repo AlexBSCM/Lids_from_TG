@@ -1,0 +1,23 @@
+{
+    "api_id": "YOUR_API_ID_HERE",
+    "api_hash": "YOUR_API_HASH_HERE",
+    "channel": "@chiangmai_chat",
+    "keywords": [
+        "экскурсия",
+        "тур по",
+        "тур на",
+        "поездка",
+        "съездить",
+        "куда поехать",
+        "север тайланд",
+        "северный таиланд",
+        "гид",
+        "гида",
+        "guide",
+        "tour to",
+        "excursion",
+        "day trip"
+    ],
+    "scan_limit": 1000,
+    "gemini_api_key": "YOUR_GEMINI_API_KEY_HERE"
+}

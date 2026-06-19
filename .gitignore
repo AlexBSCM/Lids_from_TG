@@ -56,3 +56,7 @@ Thumbs.db
 .DS_Store
 ehthumbs.db
 Desktop.ini
+# === ДОБАВЛЕНО: состояние и бэкапы сканера ===
+scan_state.json
+matches_found.backup.*.json
+scan_state.backup.*.json

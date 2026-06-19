@@ -337,17 +337,30 @@ async def run():
 
             print(f"\n  → Канал {channel}: найдено лидов {len(leads)}, last_id → {max_id_seen}")
 
-            # Отправляем уведомления о новых лидах
+            # Загружаем существующие ID лидов (для дедупликации уведомлений)
+            existing_ids = set()
+            if OUTPUT_PATH.exists():
+                try:
+                    existing_data = json.loads(OUTPUT_PATH.read_text(encoding="utf-8"))
+                    existing_ids = {x.get("id") for x in existing_data}
+                except Exception:
+                    pass
+
+            # Отправляем уведомления ТОЛЬКО по новым лидам
+            new_leads_for_notify = [l for l in leads if l["id"] not in existing_ids]
             if leads:
-                print(f"  📨 Отправка уведомлений ({len(leads)} шт.)...")
+                print(f"  📨 Отправка уведомлений: {len(new_leads_for_notify)} новых / {len(leads)} всего найдено")
+                if len(new_leads_for_notify) < len(leads):
+                    skipped = len(leads) - len(new_leads_for_notify)
+                    print(f"  ✓ Дедупликация: {skipped} уже известных лидов пропущено")
                 sent = 0
-                for lead in leads:
+                for lead in new_leads_for_notify:
                     ok = await send_notification(client, lead)
                     if ok:
                         sent += 1
                     # Пауза между уведомлениями, чтобы не получить flood_wait
                     await asyncio.sleep(1)
-                print(f"  ✓ Уведомлений отправлено: {sent}/{len(leads)}")
+                print(f"  ✓ Уведомлений отправлено: {sent}/{len(new_leads_for_notify)}")
 
         except Exception as e:
             print(f"\n  ✗ Ошибка при сканировании {channel}: {type(e).__name__}: {e}")

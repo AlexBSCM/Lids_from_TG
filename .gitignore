@@ -60,3 +60,5 @@ Desktop.ini
 scan_state.json
 matches_found.backup.*.json
 scan_state.backup.*.json
+# === ЛОГИ ===
+logs/

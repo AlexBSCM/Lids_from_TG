@@ -1,12 +1,5 @@
 """
 BanditTour Lead Scanner Bot (hybrid: user-account + bot-account).
-
-User-account (session_user.session):
-- Слушает новые сообщения в подключённых каналах через Telethon events
-
-Bot-account (session_bot.session):
-- Принимает /start, /stats, /leads и inline-кнопки
-- Отправляет уведомления вам в личку
 """
 
 import asyncio
@@ -33,7 +26,7 @@ SESSION_USER = str(BASE_DIR / "session_user")
 SESSION_BOT = str(BASE_DIR / "session_bot")
 LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
-LOG_PATH = LOG_DIR / "bot.log"
+LOG_PATH = LOG_DIR / f"bot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,6 +41,20 @@ log = logging.getLogger("bot")
 
 def load_config():
     return json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
+
+
+def save_config(config):
+    CONFIG_PATH.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_state():
+    if STATE_PATH.exists():
+        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    return {}
+
+
+def save_state(state):
+    STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def load_leads():
@@ -149,6 +156,8 @@ def classify_message(model, text, max_retries=3):
                 return {"is_lead": False, "category": "rate_limited", "reason": "лимит Gemini"}
             return {"is_lead": False, "category": "error", "reason": f"{type(e).__name__}: {msg[:100]}"}
     return {"is_lead": False, "category": "error", "reason": "все попытки исчерпаны"}
+
+
 class BotState:
     def __init__(self):
         self.config = load_config()
@@ -159,6 +168,12 @@ class BotState:
         self.is_listening = True
         self.stats_today = {"hot": 0, "warm": 0, "spam": 0, "noise": 0, "rate_limited": 0, "error": 0}
         self.stats_total = dict(self.stats_today)
+        self.user_client = None
+        self.awaiting_channel_input = False
+
+    def reload_config(self):
+        self.config = load_config()
+        self.patterns = build_patterns(self.config["keywords"])
 
     def is_lead_known(self, msg_id):
         return msg_id in self.known_ids
@@ -197,7 +212,6 @@ NOTIFY_TEMPLATE = """🎯 НОВЫЙ ЛИД — BanditTour
 
 
 async def send_notification(lead):
-    """Отправляет уведомление через bot-аккаунт."""
     try:
         text = NOTIFY_TEMPLATE.format(
             channel=lead.get("channel_title", lead.get("channel", "?")),
@@ -218,10 +232,8 @@ async def send_notification(lead):
 
 
 async def process_new_message(event):
-    """Обработчик нового сообщения в канале (через user-аккаунт)."""
     if not bs.is_listening:
         return
-
     msg = event.message
     text = msg.message or ""
     if not text_matches(text, bs.patterns):
@@ -259,10 +271,29 @@ async def process_new_message(event):
         }
         bs.add_lead(lead)
         await send_notification(lead)
+
+
+async def subscribe_to_channel(user_client, channel):
+    try:
+        entity = await user_client.get_entity(channel)
+        title = getattr(entity, "title", channel)
+
+        @user_client.on(events.NewMessage(chats=entity))
+        async def handler(event):
+            await process_new_message(event)
+
+        log.info(f"🎧 Слушаю канал: {title} ({channel})")
+        return True, title
+    except Exception as e:
+        log.error(f"Не удалось подписаться на {channel}: {e}")
+        return False, str(e)
+
+
 def main_menu_buttons():
     buttons = [
         [Button.inline("📊 Статистика", b"stats")],
         [Button.inline("📋 Последние лиды", b"leads")],
+        [Button.inline("📡 Список каналов", b"channels"), Button.inline("➕ Добавить канал", b"add_channel")],
         [Button.inline("📡 Статус слушателя", b"listener_status")],
     ]
     if bs.is_listening:
@@ -298,7 +329,8 @@ async def cmd_stats(event):
 
 **Хранилище:**
   📁 Всего лидов: {len(bs.leads)}
-  📡 Слушатель: {'▶️ активен' if bs.is_listening else '⏸ на паузе'}"""
+  📡 Слушатель: {'▶️ активен' if bs.is_listening else '⏸ на паузе'}
+  📡 Каналов: {len(bs.config['channels'])}"""
     await event.edit(text, parse_mode="md", buttons=[Button.inline("◀️ Назад", b"menu")])
 
 
@@ -317,8 +349,94 @@ async def cmd_leads(event):
     await event.edit(text, parse_mode="md", buttons=[Button.inline("◀️ Назад", b"menu")])
 
 
+async def cmd_channels(event):
+    channels = bs.config["channels"]
+    if not channels:
+        text = "📡 Каналов нет. Добавьте через «➕ Добавить канал»."
+        await event.edit(text, buttons=[Button.inline("◀️ Назад", b"menu")])
+        return
+
+    lines = ["📡 **Подключённые каналы:**\n"]
+    buttons = []
+    for i, ch in enumerate(channels, 1):
+        lines.append(f"{i}. `{ch}`")
+        buttons.append([Button.inline(f"🗑 Удалить {ch}", f"del_channel:{ch}".encode("utf-8"))])
+    buttons.append([Button.inline("➕ Добавить канал", b"add_channel")])
+    buttons.append([Button.inline("◀️ Назад", b"menu")])
+    text = "\n".join(lines)
+    await event.edit(text, parse_mode="md", buttons=buttons)
+
+
+async def cmd_add_channel_start(event):
+    bs.awaiting_channel_input = True
+    text = """➕ **Добавление канала**
+
+Отправьте @username канала (например, `@chiangmai_chat`) или ID канала.
+
+⚠️ Требования:
+• Канал должен быть публичным (иметь @username)
+• User-аккаунт должен иметь к нему доступ
+
+Для отмены нажмите кнопку ниже."""
+    await event.edit(text, parse_mode="md", buttons=[Button.inline("❌ Отмена", b"cancel_add_channel")])
+
+
+async def cmd_add_channel_cancel(event):
+    bs.awaiting_channel_input = False
+    await send_main_menu(event.chat_id)
+
+
+async def handle_channel_input(event):
+    text = event.message.message.strip()
+    bs.awaiting_channel_input = False
+
+    if not (text.startswith("@") or text.startswith("-")):
+        await event.reply("⚠ Неверный формат. Отправьте @username (например, `@chiangmai_chat`).", parse_mode="md")
+        await send_main_menu(event.chat_id)
+        return
+
+    if text in bs.config["channels"]:
+        await event.reply(f"⚠ Канал `{text}` уже есть в списке.", parse_mode="md")
+        await send_main_menu(event.chat_id)
+        return
+
+    await event.reply(f"🔄 Проверяю канал `{text}`...", parse_mode="md")
+
+    ok, info = await subscribe_to_channel(bs.user_client, text)
+    if not ok:
+        await event.reply(f"❌ Не удалось подключиться к `{text}`:\n`{info}`", parse_mode="md")
+        await send_main_menu(event.chat_id)
+        return
+
+    bs.config["channels"].append(text)
+    save_config(bs.config)
+    bs.reload_config()
+
+    await event.reply(
+        f"✅ Канал `{text}` ({info}) добавлен и слушается!\n\n"
+        f"Всего каналов: {len(bs.config['channels'])}",
+        parse_mode="md",
+        buttons=[Button.inline("◀️ В меню", b"menu")]
+    )
+
+
+async def cmd_delete_channel(event, channel):
+    if channel in bs.config["channels"]:
+        bs.config["channels"].remove(channel)
+        save_config(bs.config)
+        bs.reload_config()
+        await event.edit(
+            f"✅ Канал `{channel}` удалён.\n⚠ Бот продолжит слушать его до перезапуска.",
+            parse_mode="md",
+            buttons=[Button.inline("◀️ Назад", b"channels")]
+        )
+    else:
+        await event.edit(f"⚠ Канал `{channel}` не найден.", parse_mode="md",
+                         buttons=[Button.inline("◀️ Назад", b"channels")])
+
+
 async def cmd_listener_status(event):
-    text = f"📡 Слушатель: {'▶️ активен' if bs.is_listening else '⏸ на паузе'}"
+    text = f"📡 Слушатель: {'▶️ активен' if bs.is_listening else '⏸ на паузе'}\n📡 Каналов: {len(bs.config['channels'])}"
     await event.edit(text, buttons=[Button.inline("◀️ Назад", b"menu")])
 
 
@@ -341,18 +459,19 @@ async def cmd_help(event):
 • `/start` — главное меню
 • `/stats` — статистика
 • `/leads` — последние 10 лидов
-• `/pause` / `/resume` — управление слушателем
+
+**Управление каналами:**
+• 📡 Список каналов — посмотреть и удалить
+• ➕ Добавить канал — добавить новый через @username
 
 **Что делает бот:**
 🎧 User-аккаунт слушает каналы
 🔍 Фильтрует по keywords (34+ слов)
 🤖 Классифицирует через Gemini (только север Таиланда)
-🎯 Bot-аккаунт присылает уведомления о новых лидах
-
-**Файлы:**
-• `matches_found.json` — все лиды
-• `logs/bot.log` — логи"""
+🎯 Bot-аккаунт присылает уведомления о новых лидах"""
     await event.edit(text, parse_mode="md", buttons=[Button.inline("◀️ Назад", b"menu")])
+
+
 async def main():
     global bs, bot_client, notify_chat_id
 
@@ -369,38 +488,36 @@ async def main():
 
     bs = BotState()
 
-    # 1) User-клиент — слушает каналы
     user_client = TelegramClient(SESSION_USER, api_id, api_hash)
     log.info("Авторизация user-аккаунта...")
     await user_client.start()
     me_user = await user_client.get_me()
     log.info(f"✓ User: @{me_user.username} (id={me_user.id})")
 
-    # 2) Bot-клиент — принимает команды и отправляет уведомления
     bot_client = TelegramClient(SESSION_BOT, api_id, api_hash)
     log.info("Авторизация bot-аккаунта...")
     await bot_client.start(bot_token=bot_token)
     me_bot = await bot_client.get_me()
     log.info(f"✓ Bot: @{me_bot.username} (id={me_bot.id})")
 
-    # 3) Подписываем user-клиент на новые сообщения в каналах
+    bs.user_client = user_client
+
     for channel in channels:
-        try:
-            entity = await user_client.get_entity(channel)
-            title = getattr(entity, "title", channel)
-            log.info(f"🎧 Слушаю канал: {title} ({channel})")
-        except Exception as e:
-            log.error(f"Не удалось получить {channel}: {e}")
+        await subscribe_to_channel(user_client, channel)
 
-    @user_client.on(events.NewMessage(chats=channels))
-    async def channel_handler(event):
-        await process_new_message(event)
-
-    # 4) Регистрируем команды для bot-клиента
     @bot_client.on(events.NewMessage(pattern="/start"))
     async def start_handler(event):
         if event.is_private:
             await send_main_menu(event.chat_id)
+
+    @bot_client.on(events.NewMessage())
+    async def text_handler(event):
+        if not event.is_private:
+            return
+        if event.message.message and event.message.message.startswith("/"):
+            return
+        if bs.awaiting_channel_input:
+            await handle_channel_input(event)
 
     @bot_client.on(events.CallbackQuery)
     async def callback_handler(event):
@@ -414,6 +531,15 @@ async def main():
         elif data == "leads":
             await cmd_leads(event)
             await event.answer()
+        elif data == "channels":
+            await cmd_channels(event)
+            await event.answer()
+        elif data == "add_channel":
+            await cmd_add_channel_start(event)
+            await event.answer()
+        elif data == "cancel_add_channel":
+            await cmd_add_channel_cancel(event)
+            await event.answer()
         elif data == "listener_status":
             await cmd_listener_status(event)
             await event.answer()
@@ -426,11 +552,14 @@ async def main():
         elif data == "help":
             await cmd_help(event)
             await event.answer()
+        elif data.startswith("del_channel:"):
+            channel = data.split(":", 1)[1]
+            await cmd_delete_channel(event, channel)
+            await event.answer()
 
     log.info("✅ Бот готов. Нажмите Ctrl+C для остановки.")
     log.info(f"📝 Логи: {LOG_PATH}")
 
-    # 5) Отправляем стартовое сообщение через bot-аккаунт
     try:
         startup_text = f"""🚀 **BanditTour Lead Scanner запущен**
 
@@ -444,7 +573,6 @@ async def main():
     except Exception as e:
         log.error(f"Не удалось отправить стартовое сообщение: {e}")
 
-    # 6) Запускаем оба клиента параллельно
     await asyncio.gather(
         user_client.run_until_disconnected(),
         bot_client.run_until_disconnected(),

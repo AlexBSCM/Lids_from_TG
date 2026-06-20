@@ -154,6 +154,8 @@ class BotState:
         self.stats_total = dict(self.stats_today)
         self.user_client = None
         self.awaiting_channel_input = False
+        self.scan_in_progress = False
+        self.state = load_state()
 
     def reload_config(self):
         self.config = load_config()
@@ -449,7 +451,7 @@ def generate_chart(data_type, chart_type):
 def main_menu_buttons():
     buttons = [
         [Button.inline("📊 Статистика", b"stats")],
-        [Button.inline("📋 Последние лиды", b"leads")],
+        [Button.inline("\U0001f4cb Последние лиды", b"leads"), Button.inline("\U0001f504 Сканировать", b"scan")],
         [Button.inline("📡 Список каналов", b"channels"), Button.inline("➕ Добавить канал", b"add_channel")],
         [Button.inline("📈 Аналитика", b"analytics"), Button.inline("📡 Статус слушателя", b"listener_status")],
     ]
@@ -831,6 +833,171 @@ async def cmd_lead_author(event, index):
             )
 
 
+
+async def cmd_scan(event):
+    if bs.scan_in_progress:
+        await event.answer("Сканирование уже идёт", alert=True)
+        return
+    bs.scan_in_progress = True
+    bs.stop_scan = False
+    await event.edit("⏳ Анализирую каналы...")
+    try:
+        config = bs.config
+        from datetime import datetime, timezone, timedelta
+        initial_days = config.get("initial_scan_days", 60)
+        min_date = datetime.now(timezone.utc) - timedelta(days=initial_days)
+        preview = []
+        total_msgs = 0
+        for channel in config["channels"]:
+            try:
+                entity = await bs.user_client.get_entity(channel)
+                title = getattr(entity, "title", channel)
+                chan_state = bs.state.get(channel, {})
+                last_id = chan_state.get("last_id", 0)
+                is_first_scan = (last_id == 0)
+                count = 0
+                if is_first_scan:
+                    async for msg in bs.user_client.iter_messages(entity, limit=2000, min_id=last_id):
+                        if msg.date and msg.date < min_date:
+                            break
+                        count += 1
+                else:
+                    async for msg in bs.user_client.iter_messages(entity, limit=2000, min_id=last_id):
+                        count += 1
+                preview.append({"channel": channel, "title": title, "count": count, "is_first": is_first_scan})
+                total_msgs += count
+            except Exception as e:
+                log.error(f"Preview error {channel}: {e}")
+                preview.append({"channel": channel, "title": channel, "count": 0, "is_first": True})
+
+        estimated_leads = int(total_msgs * 0.07)
+        estimated_time_min = int(estimated_leads * 5.5 / 60)
+
+        out_lines = []
+        out_lines.append("📊 **Прогноз сканирования**\n")
+        for pv in preview:
+            mode_s = "первичный" if pv["is_first"] else "инкремент"
+            est = int(pv["count"] * 0.07)
+            short_t = pv["title"][:25]
+            out_lines.append(f"{short_t} ({mode_s}): {pv['count']} msgs, ~{est}")
+        out_lines.append("")
+        out_lines.append(f"Всего сообщений: {total_msgs}")
+        out_lines.append(f"Прогноз лидов: ~{estimated_leads}")
+        out_lines.append(f"Прогноз времени: ~{estimated_time_min} мин")
+        out_lines.append(f"Запросов Gemini: ~{estimated_leads}/1500")
+        out_lines.append("")
+        out_lines.append("Выберите режим:")
+        text = "\n".join(out_lines)
+
+        buttons = [
+            [Button.inline("⚡ Быстро", b"scan_fast"), Button.inline("🐢 Постепенно", b"scan_slow")],
+            [Button.inline("◀️ Меню", b"menu")],
+        ]
+        await event.edit(text, buttons=buttons)
+    except Exception as e:
+        log.error(f"Preview error: {e}")
+        await event.edit(f"Error: {e}", buttons=[Button.inline("◀️ Меню", b"menu")])
+    finally:
+        bs.scan_in_progress = False
+
+
+async def cmd_scan_execute(event, mode):
+    bs.scan_in_progress = True
+    bs.stop_scan = False
+    stop_btn = [Button.inline("⏹ Стоп", b"scan_stop")]
+    await event.edit(f"⏳ Сканирую ({mode})...", buttons=stop_btn)
+    try:
+        config = bs.config
+        from datetime import datetime, timezone, timedelta
+        total_new = 0
+        total_scanned = 0
+        total_gemini = 0
+        channels_processed = 0
+        chs = config["channels"]
+        for channel in chs:
+            if bs.stop_scan:
+                break
+            try:
+                entity = await bs.user_client.get_entity(channel)
+                title = getattr(entity, "title", channel)
+                chan_state = bs.state.get(channel, {})
+                last_id = chan_state.get("last_id", 0)
+                is_first_scan = (last_id == 0)
+                initial_days = config.get("initial_scan_days", 60)
+                min_date = None
+                if is_first_scan:
+                    min_date = datetime.now(timezone.utc) - timedelta(days=initial_days)
+                log.info(f"Scan: {title}")
+                candidates = []
+                scanned = 0
+                max_id_seen = last_id
+                scan_limit = config.get("scan_limit", 1000)
+                async for msg in bs.user_client.iter_messages(entity, limit=scan_limit, min_id=last_id):
+                    if is_first_scan and min_date and msg.date:
+                        if msg.date < min_date:
+                            break
+                    scanned += 1
+                    max_id_seen = max(max_id_seen, msg.id)
+                    text = msg.message or ""
+                    if text_matches(text, bs.patterns):
+                        candidates.append({
+                            "id": msg.id,
+                            "date": msg.date.isoformat() if msg.date else None,
+                            "text": text,
+                            "sender_id": msg.sender_id,
+                            "channel": channel,
+                            "channel_title": title,
+                        })
+                log.info(f"  Scanned: {scanned}, candidates: {len(candidates)}")
+                if candidates:
+                    new_leads_for_channel = 0
+                    for m in candidates:
+                        if bs.stop_scan:
+                            break
+                        if bs.is_lead_known(m["id"]):
+                            continue
+                        result = classify_message(bs.gemini, m["text"])
+                        cat = result["category"]
+                        bs.add_stat(cat)
+                        total_gemini += 1
+                        log.info(f"  id={m['id']}: {cat}")
+                        if result["is_lead"]:
+                            m["category"] = cat
+                            m["reason"] = result["reason"]
+                            m["classified_at"] = datetime.now(timezone.utc).isoformat()
+                            bs.add_lead(m)
+                            await send_notification(m)
+                            new_leads_for_channel += 1
+                            total_new += 1
+                        time.sleep(5.5)
+                    log.info(f"  New leads: {new_leads_for_channel}")
+                bs.state[channel] = {
+                    "last_id": max_id_seen,
+                    "last_scan_at": datetime.now(timezone.utc).isoformat(),
+                    "first_scan_at": chan_state.get("first_scan_at", datetime.now(timezone.utc).isoformat()),
+                }
+                save_state(bs.state)
+                channels_processed += 1
+                total_scanned += scanned
+                if not bs.stop_scan:
+                    prog_text = f"⏳ Каналов: {channels_processed}/{len(chs)} | Просмотрено: {total_scanned} | Лидов: {total_new} | Gemini: {total_gemini}/1500"
+                    await event.edit(prog_text, buttons=stop_btn)
+                if mode == "slow" and not bs.stop_scan:
+                    await asyncio.sleep(30)
+            except Exception as e:
+                log.error(f"Scan error {channel}: {e}")
+        if bs.stop_scan:
+            fin_text = f"⏹ Остановлено | Каналов: {channels_processed}/{len(chs)} | Лидов: {total_new} | Gemini: {total_gemini}"
+        else:
+            fin_text = f"✅ Готово | Каналов: {channels_processed}/{len(chs)} | Лидов: {total_new} | Gemini: {total_gemini}/1500 | Всего: {len(bs.leads)}"
+        await event.edit(fin_text, buttons=[Button.inline("◀️ Меню", b"menu")])
+    except Exception as e:
+        log.error(f"Scan execute error: {e}")
+        await event.edit(f"Error: {e}", buttons=[Button.inline("◀️ Меню", b"menu")])
+    finally:
+        bs.scan_in_progress = False
+        bs.stop_scan = False
+
 async def main():
     global bs, bot_client, notify_chat_id
 
@@ -924,6 +1091,18 @@ async def main():
         elif data == "resume":
             await cmd_resume(event)
             await event.answer()
+        elif data == "scan":
+            await cmd_scan(event)
+            await event.answer()
+        elif data == "scan_fast":
+            await cmd_scan_execute(event, "fast")
+            await event.answer()
+        elif data == "scan_slow":
+            await cmd_scan_execute(event, "slow")
+            await event.answer()
+        elif data == "scan_stop":
+            bs.stop_scan = True
+            await event.answer("Останавливаю...", alert=True)
         elif data == "help":
             await cmd_help(event)
             await event.answer()

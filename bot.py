@@ -983,6 +983,12 @@ async def cmd_scan_execute(event, mode):
                     scanned += 1
                     max_id_seen = max(max_id_seen, msg.id)
                     text = msg.message or ""
+                    # Mojibake fix
+                    try:
+                        if text and ("Р" in text or "С" in text):
+                            text = text.encode("windows-1251", errors="ignore").decode("utf-8", errors="replace")
+                    except:
+                        pass
                     if text_matches(text, bs.patterns):
                         candidates.append({
                             "id": msg.id,
@@ -1031,9 +1037,9 @@ async def cmd_scan_execute(event, mode):
             except Exception as e:
                 log.error(f"Scan error {channel}: {e}")
         if bs.stop_scan:
-            fin_text = f"⏹ Остановлено | Каналов: {channels_processed}/{len(chs)} | Лидов: {total_new} | Gemini: {total_gemini}"
+            fin_text = f"⏹ Остановлено | Каналов: {channels_processed}/{len(chs)} | Новых лидов: {total_new} | Gemini: {total_gemini}"
         else:
-            fin_text = f"✅ Готово | Каналов: {channels_processed}/{len(chs)} | Лидов: {total_new} | Gemini: {total_gemini}/1500 | Всего: {len(bs.leads)}"
+            fin_text = f"✅ Скан завершён | Каналов: {channels_processed}/{len(chs)} | Новых лидов: {total_new} | Gemini: {total_gemini}/1500 | Всего в базе: {len(bs.leads)}"
         await event.edit(fin_text, buttons=[Button.inline("◀️ Меню", b"menu")])
     except Exception as e:
         log.error(f"Scan execute error: {e}")

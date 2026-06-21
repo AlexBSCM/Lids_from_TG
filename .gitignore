@@ -72,3 +72,14 @@ run_bot_hidden.vbs
 bot_*.log
 bot_hidden.log
 chart.png
+
+# === Dashboard и временные файлы ===
+dashboard.html
+dashboard_server.py
+generate_dashboard.py
+write_dashboard.py
+fix_*.py
+add_*.py
+rewrite_*.py
+smart_scan*.py
+update_prompt*.py

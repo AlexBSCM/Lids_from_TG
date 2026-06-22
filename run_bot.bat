@@ -1,5 +1,8 @@
 @echo off
+chcp 65001 > nul
 cd /d D:\BanditTour\Lids_from_TG
+
+set PYTHON_EXE=C:\Users\AVZ\AppData\Local\Python\pythoncore-3.12-64\python.exe
 
 echo [%date% %time%] Starting bot hidden >> logs\startup.log
 

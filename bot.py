@@ -249,6 +249,21 @@ def fix_mojibake(text):
             pass
     return text
 
+def format_thai_time(date_str):
+    if not date_str or len(date_str) < 16:
+        return "?", "?"
+    try:
+        dt = datetime.fromisoformat(date_str)
+        dt_local = dt + timedelta(hours=7)
+        date_part = f"{dt_local.day:02d}.{dt_local.month:02d}.{str(dt_local.year)[2:]}"
+        time_part = f"{dt_local.hour:02d}:{dt_local.minute:02d}"
+        return date_part, time_part
+    except:
+        d = date_str[:10].split("-")
+        date_part = f"{d[2]}.{d[1]}.{d[0][2:]}"
+        time_part = date_str[11:16]
+        return date_part, time_part
+
 async def send_notification(lead):
     try:
         text = NOTIFY_TEMPLATE.format(
@@ -332,7 +347,18 @@ _lead_view_state = {}
 
 def format_lead_card(lead, index, total):
     emoji = {"hot": "🔥", "warm": "🌤", "spam": "🗑", "noise": "❌"}.get(lead.get("category", ""), "❓")
-    date = lead.get("date", "?")[:16].replace("T", " ")
+    date_str = lead.get("date", "")
+    if date_str:
+        try:
+            dt = datetime.fromisoformat(date_str) + timedelta(hours=7)
+            date_part = f"{dt.day:02d}.{dt.month:02d}.{str(dt.year)[2:]}"
+            time_part = f"{dt.hour:02d}:{dt.minute:02d}"
+        except:
+            date_part = "?"
+            time_part = "?"
+    else:
+        date_part = "?"
+        time_part = "?"
     channel_title = lead.get("channel_title", lead.get("channel", "?"))
     channel = lead.get("channel", "")
     msg_id = lead.get("id", "?")
@@ -345,14 +371,15 @@ def format_lead_card(lead, index, total):
     else:
         preview_text = full_text
         has_full = False
-    text_out = f"{emoji} **{lead.get('category', '?').upper()}** | {date}\\n"
-    text_out += f"📍 {channel_title} (`{channel}`)\\n"
-    text_out += f"👤 Sender ID: `{sender_id}`\\n"
-    text_out += f"🔢 Message ID: `{msg_id}`\\n"
+    text_out = f"{emoji} **{lead.get('category', '?').upper()}**\n"
+    text_out += f"📅 {date_part}\n🕐 {time_part}\n"
+    text_out += f"📍 {channel_title} (`{channel}`)\n"
+    text_out += f"👤 Sender ID: `{sender_id}`\n"
+    text_out += f"🔢 Message ID: `{msg_id}`\n"
     if reason:
-        text_out += f"🤖 Причина: {reason}\\n"
-    text_out += f"\\n💬 **Текст сообщения:**\\n```\\n{preview_text}\\n```"
-    text_out += f"\\n\\n_Лид {index + 1} из {total}_"
+        text_out += f"🤖 Причина: {reason}\n"
+    text_out += f"\n💬 **Текст сообщения:**\n```\n{preview_text}\n```"
+    text_out += f"\n\n_Лид {index + 1} из {total}_"
     return text_out, has_full
 
 def get_lead_card_buttons(index, total, lead, has_full=True, username=None):
@@ -420,7 +447,7 @@ async def cmd_lead_full(event, index):
     emoji = {"hot": "🔥", "warm": "🌤", "spam": "🗑", "noise": "❌"}.get(lead.get("category", ""), "❓")
     date = lead.get("date", "?")[:16].replace("T", " ")
     channel_title = lead.get("channel_title", lead.get("channel", "?"))
-    header = f"{emoji} **ПОЛНОЕ СООБЩЕНИЕ** | {date}\\n📍 {channel_title}\\n\\n```\\n"
+    header = f"{emoji} **ПОЛНОЕ СООБЩЕНИЕ** | {date_part} 🕐 {time_part}\n📍 {channel_title}\n\n```\n"
     footer = "\\n```"
     max_chunk = 4000 - len(header) - len(footer)
     chunks = [full_text[i:i+max_chunk] for i in range(0, len(full_text), max_chunk)]
@@ -428,7 +455,7 @@ async def cmd_lead_full(event, index):
         if i == 0:
             text_to_send = header + chunk + footer
         else:
-            text_to_send = f"```\\n{chunk}\\n```"
+            text_to_send = f"```\n{chunk}\n```"
         await bot_client.send_message(event.chat_id, text_to_send, parse_mode="md")
         await asyncio.sleep(0.3)
     await event.answer("Полный текст отправлен выше ✓")

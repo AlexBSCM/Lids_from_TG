@@ -81,8 +81,8 @@ def save_leads(leads):
 def build_patterns(keywords):
     patterns = []
     for kw in keywords:
-        if re.fullmatch(r"[a-zA-Z\\s]+", kw) and len(kw) <= 15:
-            pat = r"\\b" + re.escape(kw) + r"\\b"
+        if re.fullmatch(r"[a-zA-Z\s]+", kw) and len(kw) <= 15:
+            pat = r"\b" + re.escape(kw) + r"\b"
         else:
             pat = re.escape(kw)
         patterns.append(re.compile(pat, re.IGNORECASE))
@@ -154,8 +154,8 @@ def classify_message(model, text, max_retries=3):
             resp = model.generate_content(prompt)
             raw = resp.text.strip()
             if raw.startswith("```"):
-                raw = re.sub(r"^```(?:json)?\\s*", "", raw)
-                raw = re.sub(r"\\s*```$", "", raw)
+                raw = re.sub(r"^```(?:json)?\s*", "", raw)
+                raw = re.sub(r"\s*```$", "", raw)
             data = json.loads(raw)
             return {
                 "is_lead": bool(data.get("is_lead", False)),
@@ -168,7 +168,7 @@ def classify_message(model, text, max_retries=3):
             msg = str(e)
             if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
                 wait = 30
-                m = re.search(r"retry in ([\\d.]+)s", msg.lower()) or re.search(r"seconds:\\s*(\\d+)", msg.lower())
+                m = re.search(r"retry in ([\d.]+)s", msg.lower()) or re.search(r"seconds:\s*(\d+)", msg.lower())
                 if m:
                     try:
                         wait = int(float(m.group(1))) + 2
@@ -223,11 +223,16 @@ notify_chat_id = None
 
 CATEGORY_EMOJI = {"hot": "🔥", "warm": "🌤", "spam": "🗑", "noise": "❌"}
 
+STATUS_EMOJI = {"new": "🆕", "contacted": "📞", "in_progress": "💬", "converted": "✅", "lost": "❌"}
+STATUS_LABELS = {"new": "Новый", "contacted": "Связались", "in_progress": "В работе", "converted": "Клиент", "lost": "Отказ"}
+
 NOTIFY_TEMPLATE = """🎯 НОВЫЙ ЛИД — BanditTour
 
 📍 Канал: {channel}
-📅 Дата: {date}
+📅 Дата: {date_part}
+🕐 Время: {time_part}
 🏷 Категория: {category_emoji} {category}
+🔄 Статус: {status_emoji} {status_label}
 👤 Sender ID: {sender_id}
 🔢 Message ID: {msg_id}
 🤖 Причина: {reason}
@@ -249,28 +254,29 @@ def fix_mojibake(text):
             pass
     return text
 
-def format_thai_time(date_str):
-    if not date_str or len(date_str) < 16:
-        return "?", "?"
-    try:
-        dt = datetime.fromisoformat(date_str)
-        dt_local = dt + timedelta(hours=7)
-        date_part = f"{dt_local.day:02d}.{dt_local.month:02d}.{str(dt_local.year)[2:]}"
-        time_part = f"{dt_local.hour:02d}:{dt_local.minute:02d}"
-        return date_part, time_part
-    except:
-        d = date_str[:10].split("-")
-        date_part = f"{d[2]}.{d[1]}.{d[0][2:]}"
-        time_part = date_str[11:16]
-        return date_part, time_part
-
 async def send_notification(lead):
     try:
+        date_str = lead.get("date", "?")
+        if date_str and len(date_str) >= 16:
+            try:
+                dt = datetime.fromisoformat(date_str) + timedelta(hours=7)
+                date_part = f"{dt.day:02d}.{dt.month:02d}.{str(dt.year)[2:]}"
+                time_part = f"{dt.hour:02d}:{dt.minute:02d}"
+            except:
+                date_part = "?"
+                time_part = "?"
+        else:
+            date_part = "?"
+            time_part = "?"
+            
         text = NOTIFY_TEMPLATE.format(
             channel=lead.get("channel_title", lead.get("channel", "?")),
-            date=lead.get("date", "?"),
+            date_part=date_part,
+            time_part=time_part,
             category_emoji=CATEGORY_EMOJI.get(lead.get("category", ""), "❓"),
             category=lead.get("category", "?").upper(),
+            status_emoji=STATUS_EMOJI.get(lead.get("status", "new"), "❓"),
+            status_label=STATUS_LABELS.get(lead.get("status", "new"), "new"),
             sender_id=lead.get("sender_id", "?"),
             msg_id=lead.get("id", "?"),
             reason=lead.get("reason", ""),
@@ -320,6 +326,7 @@ async def process_new_message(event):
             "channel": channel,
             "channel_title": channel_title,
             "category": cat,
+            "status": "new",
             "reason": result["reason"],
             "classified_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -359,6 +366,9 @@ def format_lead_card(lead, index, total):
     else:
         date_part = "?"
         time_part = "?"
+    status = lead.get("status", "new")
+    status_emoji = STATUS_EMOJI.get(status, "❓")
+    status_label = STATUS_LABELS.get(status, status)
     channel_title = lead.get("channel_title", lead.get("channel", "?"))
     channel = lead.get("channel", "")
     msg_id = lead.get("id", "?")
@@ -371,7 +381,7 @@ def format_lead_card(lead, index, total):
     else:
         preview_text = full_text
         has_full = False
-    text_out = f"{emoji} **{lead.get('category', '?').upper()}**\n"
+    text_out = f"{emoji} **{lead.get('category', '?').upper()}** | {status_emoji} {status_label}\n"
     text_out += f"📅 {date_part}\n🕐 {time_part}\n"
     text_out += f"📍 {channel_title} (`{channel}`)\n"
     text_out += f"👤 Sender ID: `{sender_id}`\n"
@@ -391,6 +401,7 @@ def get_lead_card_buttons(index, total, lead, has_full=True, username=None):
     buttons.append(nav_row)
     if has_full:
         buttons.append([Button.inline("📖 Прочитать полностью", f"lead_full:{index}".encode("utf-8"))])
+    buttons.append([Button.inline("🔄 Сменить статус", f"lead_status:{index}".encode("utf-8"))])
     sender_id = lead.get("sender_id")
     channel = lead.get("channel", "").lstrip("@")
     if channel and lead.get("id"):
@@ -445,10 +456,21 @@ async def cmd_lead_full(event, index):
     lead = bs.leads[index]
     full_text = lead.get("text", "")
     emoji = {"hot": "🔥", "warm": "🌤", "spam": "🗑", "noise": "❌"}.get(lead.get("category", ""), "❓")
-    date = lead.get("date", "?")[:16].replace("T", " ")
+    date_str = lead.get("date", "")
+    if date_str:
+        try:
+            dt = datetime.fromisoformat(date_str) + timedelta(hours=7)
+            date_part = f"{dt.day:02d}.{dt.month:02d}.{str(dt.year)[2:]}"
+            time_part = f"{dt.hour:02d}:{dt.minute:02d}"
+        except:
+            date_part = "?"
+            time_part = "?"
+    else:
+        date_part = "?"
+        time_part = "?"
     channel_title = lead.get("channel_title", lead.get("channel", "?"))
-    header = f"{emoji} **ПОЛНОЕ СООБЩЕНИЕ** | {date_part} 🕐 {time_part}\n📍 {channel_title}\n\n```\n"
-    footer = "\\n```"
+    header = f"{emoji} **ПОЛНОЕ СООБЩЕНИЕ**\n📅 {date_part} 🕐 {time_part}\n📍 {channel_title}\n\n```\n"
+    footer = "\n```"
     max_chunk = 4000 - len(header) - len(footer)
     chunks = [full_text[i:i+max_chunk] for i in range(0, len(full_text), max_chunk)]
     for i, chunk in enumerate(chunks):
@@ -486,10 +508,39 @@ async def cmd_lead_author(event, index):
         try:
             channel_entity = await bs.user_client.get_entity(channel)
             await bs.user_client.forward_messages(entity=event.chat_id, messages=msg_id, from_peer=channel_entity)
-            await bot_client.send_message(event.chat_id, "✅ Выше переслано сообщение от автора.\\n\\n👉 Нажмите на имя автора в пересланном сообщении, чтобы открыть его профиль и написать ему.", link_preview=False)
+            await bot_client.send_message(event.chat_id, "✅ Выше переслано сообщение от автора.\n\n👉 Нажмите на имя автора в пересланном сообщении, чтобы открыть его профиль и написать ему.", link_preview=False)
         except Exception as e:
             log.error(f"Ошибка пересылки: {e}")
-            await bot_client.send_message(event.chat_id, f"⚠ Не удалось переслать сообщение.\\n\\nID автора: `{sender_id}`\\n\\nНайдите его через поиск в Telegram по ID.", parse_mode="md", link_preview=False)
+            await bot_client.send_message(event.chat_id, f"⚠ Не удалось переслать сообщение.\n\nID автора: `{sender_id}`\n\nНайдите его через поиск в Telegram по ID.", parse_mode="md", link_preview=False)
+
+async def cmd_lead_status_menu(event, index):
+    if index >= len(bs.leads):
+        await event.answer("Лид не найден", alert=True)
+        return
+    lead = bs.leads[index]
+    current_status = lead.get("status", "new")
+    text = f"🔄 **Смена статуса лида**\n\nТекущий статус: {STATUS_EMOJI.get(current_status, '❓')} {STATUS_LABELS.get(current_status, current_status)}\n\nВыберите новый статус:"
+    buttons = [
+        [Button.inline("🆕 Новый", f"set_status:{index}:new".encode("utf-8")),
+         Button.inline("📞 Связались", f"set_status:{index}:contacted".encode("utf-8"))],
+        [Button.inline("💬 В работе", f"set_status:{index}:in_progress".encode("utf-8")),
+         Button.inline("✅ Клиент", f"set_status:{index}:converted".encode("utf-8"))],
+        [Button.inline("❌ Отказ", f"set_status:{index}:lost".encode("utf-8"))],
+        [Button.inline("◀️ Назад к лиду", f"leads_back:{index}".encode("utf-8"))],
+    ]
+    await event.edit(text, parse_mode="md", buttons=buttons)
+
+async def cmd_set_status(event, index, new_status):
+    if index >= len(bs.leads):
+        await event.answer("Лид не найден", alert=True)
+        return
+    if new_status not in STATUS_EMOJI:
+        await event.answer("Неверный статус", alert=True)
+        return
+    bs.leads[index]["status"] = new_status
+    save_leads(bs.leads)
+    await event.answer(f"Статус изменён на: {STATUS_LABELS[new_status]}", alert=True)
+    await cmd_leads(event, index)
 
 
 def _get_category_stats():
@@ -653,7 +704,9 @@ def main_menu_buttons():
     return buttons
 
 async def send_main_menu(chat_id):
-    text = "🤖 **BanditTour Lead Scanner**\n\nГлавное меню — выберите действие:"
+    text = """🤖 **BanditTour Lead Scanner**
+
+Главное меню — выберите действие:"""
     await bot_client.send_message(chat_id, text, buttons=main_menu_buttons(), parse_mode="md")
 
 async def cmd_dashboard(event):
@@ -698,7 +751,9 @@ async def cmd_stats(event):
     await event.edit(text, parse_mode="md", buttons=[Button.inline("◀️ Назад", b"menu")])
 
 async def cmd_analytics_menu(event):
-    text = "📈 **Аналитика**\n\n**Шаг 1:** Выберите данные для графика:"
+    text = """📈 **Аналитика**
+
+**Шаг 1:** Выберите данные для графика:"""
     buttons = [
         [Button.inline("🥧 По категориям", b"data:categories")],
         [Button.inline("📅 По дням (14 дней)", b"data:days")],
@@ -709,7 +764,9 @@ async def cmd_analytics_menu(event):
 
 async def cmd_analytics_chart_type(event, data_type):
     names = {"categories": "🥧 По категориям", "days": "📅 По дням (14 дней)", "channels": "📡 По каналам"}
-    text = f"📈 **Аналитика → {names.get(data_type, data_type)}**\n\n**Шаг 2:** Выберите тип графика:"
+    text = f"""📈 **Аналитика → {names.get(data_type, data_type)}**
+
+**Шаг 2:** Выберите тип графика:"""
     if data_type == "categories":
         buttons = [
             [Button.inline("🥧 Круговая", b"chart:categories:pie"), Button.inline("📊 Столбчатая", b"chart:categories:bar")],
@@ -964,6 +1021,7 @@ async def cmd_scan_execute(event, mode):
                         log.info(f"  id={m['id']}: {cat}")
                         if result["is_lead"]:
                             m["category"] = cat
+                            m["status"] = "new"
                             m["reason"] = result["reason"]
                             m["classified_at"] = datetime.now(timezone.utc).isoformat()
                             bs.add_lead(m)
@@ -1075,6 +1133,21 @@ async def main():
         elif data.startswith("lead_author:"):
             idx = int(data.split(":", 1)[1])
             await cmd_lead_author(event, idx)
+            await event.answer()
+        elif data.startswith("lead_status:"):
+            idx = int(data.split(":", 1)[1])
+            await cmd_lead_status_menu(event, idx)
+            await event.answer()
+        elif data.startswith("set_status:"):
+            parts = data.split(":", 2)
+            if len(parts) == 3:
+                idx = int(parts[1])
+                new_status = parts[2]
+                await cmd_set_status(event, idx, new_status)
+            await event.answer()
+        elif data.startswith("leads_back:"):
+            idx = int(data.split(":", 1)[1])
+            await cmd_leads(event, idx)
             await event.answer()
         elif data == "channels":
             await cmd_channels(event)

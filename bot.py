@@ -145,7 +145,7 @@ def init_gemini(api_key, model_name):
     genai.configure(api_key=api_key)
     return genai.GenerativeModel(model_name)
 
-def classify_message(model, text, max_retries=3):
+def classify_message(model, text, max_retries=5):
     if not text or len(text.strip()) < 10:
         return {"is_lead": False, "category": "noise", "reason": "слишком короткое"}
     prompt = CLASSIFY_PROMPT.format(message=text[:1500])
@@ -167,18 +167,21 @@ def classify_message(model, text, max_retries=3):
         except Exception as e:
             msg = str(e)
             if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
-                wait = 30
+                wait = min(3 * (attempt + 1), 15)
                 m = re.search(r"retry in ([\d.]+)s", msg.lower()) or re.search(r"seconds:\s*(\d+)", msg.lower())
                 if m:
                     try:
-                        wait = int(float(m.group(1))) + 2
+                        parsed = int(float(m.group(1))) + 1
+                        wait = min(parsed, 15)
                     except ValueError:
                         pass
                 if attempt < max_retries - 1:
                     log.warning(f"  rate_limited, жду {wait}с (попытка {attempt+1}/{max_retries})")
-                    time.sleep(wait)
+                    # Неблокирующий sleep через threading.Event
+                    import threading
+                    threading.Event().wait(wait)
                     continue
-                return {"is_lead": False, "category": "rate_limited", "reason": "лимит Gemini"}
+                return {"is_lead": False, "category": "rate_limited", "reason": "лимит Gemini (5 попыток)"}
             return {"is_lead": False, "category": "error", "reason": f"{type(e).__name__}: {msg[:100]}"}
     return {"is_lead": False, "category": "error", "reason": "все попытки исчерпаны"}
 
@@ -198,6 +201,7 @@ class BotState:
         self.scan_in_progress = False
         self.stop_scan = False
         self.state = load_state()
+        self.last_auto_scan_date = None
 
     def reload_config(self):
         self.config = load_config()
@@ -956,7 +960,7 @@ async def cmd_scan(event):
         text = "\n".join(out_lines)
 
         buttons = [
-            [Button.inline("⚡ Быстро", b"scan_fast"), Button.inline("🐢 Постепенно", b"scan_slow")],
+            [Button.inline("⚡ Быстро", b"scan_fast"), Button.inline("🐢 Постепенно", b"scan_slow"), Button.inline("🔀 Гибридно", b"scan_hybrid")],
             [Button.inline("◀️ Меню", b"menu")],
         ]
         await event.edit(text, buttons=buttons)
@@ -979,6 +983,53 @@ async def cmd_scan_execute(event, mode):
         total_gemini = 0
         channels_processed = 0
         chs = config["channels"]
+        total_channels = len(chs)
+        scan_start_time = datetime.now(timezone.utc)
+
+        last_edit_time = [0]
+        spinner_chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        spinner_idx = [0]
+        progress_msg = event
+
+        async def update_progress(title, status_line, chan_scanned=0, chan_leads=0, force=False):
+            now_ts = datetime.now(timezone.utc).timestamp()
+            if not force and now_ts - last_edit_time[0] < 2:
+                return
+            last_edit_time[0] = now_ts
+            spinner = spinner_chars[spinner_idx[0] % len(spinner_chars)]
+            spinner_idx[0] += 1
+            elapsed = (datetime.now(timezone.utc) - scan_start_time).total_seconds()
+            if channels_processed > 0 and elapsed > 0:
+                avg_per_chan = elapsed / channels_processed
+                remaining_chans = total_channels - channels_processed
+                eta_secs = int(avg_per_chan * remaining_chans)
+                eta_mins = eta_secs // 60
+                eta_s = eta_secs % 60
+                eta = f"{eta_mins}m {eta_s}s"
+            else:
+                eta = "..."
+            try:
+                mins = int(elapsed // 60)
+                secs = int(elapsed % 60)
+                pct = int((channels_processed / total_channels) * 100) if total_channels else 0
+                bar_len = 20
+                filled = int(bar_len * channels_processed / total_channels) if total_channels else 0
+                bar = "▓" * filled + "░" * (bar_len - filled)
+                text = (
+                    f"🔄 *Скан в процессе* ({mode})\n\n"
+                    f"{spinner} `{bar}` {channels_processed}/{total_channels} ({pct}%) - ETA: {eta}\n\n"
+                    f"▶ Текущий: {title}\n"
+                    f"  {status_line}\n\n"
+                    f"✅ Готово каналов: {channels_processed}\n"
+                    f"🎯 Найдено: {total_new} (+{chan_leads} в текущем)\n"
+                    f"🤖 Gemini: {total_gemini}/1500\n"
+                    f"📡 Проверено: {total_scanned + chan_scanned}\n"
+                    f"⏱ Время: {mins}м {secs}с"
+                )
+                await progress_msg.edit(text, parse_mode="md", buttons=stop_btn)
+            except Exception as e:
+                log.debug(f"progress edit failed: {e}")
+
         for channel in chs:
             if bs.stop_scan: break
             try:
@@ -996,6 +1047,9 @@ async def cmd_scan_execute(event, mode):
                 scanned = 0
                 max_id_seen = last_id
                 scan_limit = config.get("scan_limit", 1000)
+
+                await update_progress(title, "📥 Скачиваю сообщения...", 0, 0, force=True)
+
                 async for msg in bs.user_client.iter_messages(entity, limit=scan_limit, min_id=last_id):
                     if is_first_scan and min_date and msg.date:
                         if msg.date < min_date: break
@@ -1008,13 +1062,18 @@ async def cmd_scan_execute(event, mode):
                             "id": msg.id, "date": msg.date.isoformat() if msg.date else None,
                             "text": text, "sender_id": msg.sender_id, "channel": channel, "channel_title": title,
                         })
+                    if scanned % 25 == 0:
+                        await update_progress(title, f"📥 Сканирую: {scanned} сообщ. | кандидатов: {len(candidates)}", scanned, 0)
+
                 log.info(f"  Scanned: {scanned}, candidates: {len(candidates)}")
+                new_leads_for_channel = 0
                 if candidates:
-                    new_leads_for_channel = 0
-                    for m in candidates:
+                    total_candidates = len(candidates)
+                    await update_progress(title, f"🤖 Классифицирую: 0/{total_candidates} | +0 лидов", scanned, 0, force=True)
+                    for i, m in enumerate(candidates):
                         if bs.stop_scan: break
                         if bs.is_lead_known(m["id"]): continue
-                        result = classify_message(bs.gemini, m["text"])
+                        result = await asyncio.to_thread(classify_message, bs.gemini, m["text"])
                         cat = result["category"]
                         bs.add_stat(cat)
                         total_gemini += 1
@@ -1028,8 +1087,15 @@ async def cmd_scan_execute(event, mode):
                             await send_notification(m)
                             new_leads_for_channel += 1
                             total_new += 1
-                        time.sleep(5.5)
-                    log.info(f"  New leads: {new_leads_for_channel}")
+
+                        await update_progress(
+                            title,
+                            f"🤖 Классифицирую: {i+1}/{total_candidates} | +{new_leads_for_channel} лидов",
+                            scanned, new_leads_for_channel
+                        )
+                        await asyncio.sleep(8.0)
+
+                log.info(f"  New leads: {new_leads_for_channel}")
                 bs.state[channel] = {
                     "last_id": max_id_seen,
                     "last_scan_at": datetime.now(timezone.utc).isoformat(),
@@ -1038,24 +1104,312 @@ async def cmd_scan_execute(event, mode):
                 save_state(bs.state)
                 channels_processed += 1
                 total_scanned += scanned
-                if not bs.stop_scan:
-                    prog_text = f"⏳ Каналов: {channels_processed}/{len(chs)} | Просмотрено: {total_scanned} | Лидов: {total_new} | Gemini: {total_gemini}/1500"
-                    await event.edit(prog_text, buttons=stop_btn)
+
+                await update_progress(title, f"✅ Готово (+{new_leads_for_channel} лидов, {scanned} сообщ.)", 0, new_leads_for_channel, force=True)
+
                 if mode == "slow" and not bs.stop_scan:
                     await asyncio.sleep(30)
             except Exception as e:
                 log.error(f"Scan error {channel}: {e}")
+
+        elapsed = (datetime.now(timezone.utc) - scan_start_time).total_seconds()
+        mins = int(elapsed // 60)
+        secs = int(elapsed % 60)
         if bs.stop_scan:
-            fin_text = f"⏹ Остановлено | Каналов: {channels_processed}/{len(chs)} | Новых лидов: {total_new} | Gemini: {total_gemini}"
+            fin_text = f"⏹ *Остановлено*\n\n📡 Каналов: {channels_processed}/{len(chs)}\n🎯 Новых лидов: {total_new}\n🤖 Gemini: {total_gemini}/1500\n⏱ Время: {mins}м {secs}с"
         else:
-            fin_text = f"✅ Скан завершён | Каналов: {channels_processed}/{len(chs)} | Новых лидов: {total_new} | Gemini: {total_gemini}/1500 | Всего в базе: {len(bs.leads)}"
-        await event.edit(fin_text, buttons=[Button.inline("◀️ Меню", b"menu")])
+            fin_text = (
+                f"✅ *Скан завершён*\n\n"
+                f"⏱ Время: {mins}м {secs}с\n"
+                f"📡 Каналов: {channels_processed}/{len(chs)}\n"
+                f"🎯 Новых лидов: {total_new}\n"
+                f"🤖 Gemini: {total_gemini}/1500\n"
+                f"📁 Всего в базе: {len(bs.leads)}"
+            )
+        await event.edit(fin_text, parse_mode="md", buttons=[Button.inline("◀️ В меню", b"menu")])
+
+        await asyncio.sleep(3)
+        try:
+            await send_main_menu(event.chat_id)
+        except Exception as e:
+            log.warning(f"Не удалось показать меню после скана: {e}")
     except Exception as e:
         log.error(f"Scan execute error: {e}")
-        await event.edit(f"Error: {e}", buttons=[Button.inline("◀️ Меню", b"menu")])
+        await event.edit(f"Error: {e}", buttons=[Button.inline("◀️ В меню", b"menu")])
     finally:
         bs.scan_in_progress = False
         bs.stop_scan = False
+
+
+async def check_and_run_auto_scan():
+    """Проверяет, нужно ли запустить автоскан (1 раз в день при первом запуске)."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if bs.last_auto_scan_date == today:
+        return
+    log.info(f"📅 Автоскан: первый запуск за день ({today})")
+    bs.last_auto_scan_date = today
+
+    fast_channels = []
+    slow_channels = []
+    for channel in bs.config["channels"]:
+        chan_state = bs.state.get(channel, {})
+        if chan_state.get("last_id", 0) > 0:
+            fast_channels.append(channel)
+        else:
+            slow_channels.append(channel)
+
+    chs = bs.config["channels"]
+    total_channels = len(chs)
+    scan_start_time = datetime.now(timezone.utc)
+
+    progress_msg = None
+    try:
+        start_text = (
+            f"📅 *Автоскан запущен*\n\n"
+            f"⚡ Быстрых: {len(fast_channels)}\n"
+            f"🐢 Медленных: {len(slow_channels)}\n\n"
+            f"⏳ Подготовка..."
+        )
+        progress_msg = await bot_client.send_message(int(notify_chat_id), start_text, parse_mode="md")
+    except Exception as e:
+        log.warning(f"Не удалось создать прогресс-сообщение: {e}")
+
+    total_new = 0
+    total_gemini = 0
+    total_scanned = 0
+    channels_processed = 0
+
+    last_edit_time = [0]
+    spinner_chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    spinner_idx = [0]
+
+    async def update_progress(chan_idx, title, status_line, chan_scanned=0, chan_leads=0, force=False):
+        nonlocal progress_msg
+        if progress_msg is None:
+            return
+        now_ts = datetime.now(timezone.utc).timestamp()
+        if not force and now_ts - last_edit_time[0] < 2:
+            return
+        last_edit_time[0] = now_ts
+        spinner = spinner_chars[spinner_idx[0] % len(spinner_chars)]
+        spinner_idx[0] += 1
+        elapsed = (datetime.now(timezone.utc) - scan_start_time).total_seconds()
+        if channels_processed > 0 and elapsed > 0:
+            avg_per_chan = elapsed / channels_processed
+            remaining_chans = total_channels - channels_processed
+            eta_secs = int(avg_per_chan * remaining_chans)
+            eta_mins = eta_secs // 60
+            eta_s = eta_secs % 60
+            eta = f"{eta_mins}m {eta_s}s"
+        else:
+            eta = "..."
+        try:
+            mins = int(elapsed // 60)
+            secs = int(elapsed % 60)
+            pct = int((channels_processed / total_channels) * 100) if total_channels else 0
+            bar_len = 20
+            filled = int(bar_len * channels_processed / total_channels) if total_channels else 0
+            bar = "▓" * filled + "░" * (bar_len - filled)
+            text = (
+                f"📅 *Автоскан в процессе*\n\n"
+                f"{spinner} `{bar}` {channels_processed}/{total_channels} ({pct}%) - ETA: {eta}\n\n"
+                f"▶ Текущий: {title}\n"
+                f"  {status_line}\n\n"
+                f"✅ Готово каналов: {channels_processed}\n"
+                f"🎯 Лидов найдено: {total_new} (+{chan_leads} в текущем)\n"
+                f"🤖 Gemini: {total_gemini}/1500\n"
+                f"📡 Сообщений проверено: {total_scanned + chan_scanned}\n"
+                f"⏱ Время: {mins}м {secs}с"
+            )
+            await progress_msg.edit(text, parse_mode="md")
+        except Exception as e:
+            log.debug(f"progress edit failed: {e}")
+
+    for channel in fast_channels:
+        if bs.stop_scan:
+            break
+        try:
+            entity = await bs.user_client.get_entity(channel)
+            title = getattr(entity, "title", channel)
+            chan_state = bs.state.get(channel, {})
+            last_id = chan_state.get("last_id", 0)
+            log.info(f"⚡ Автоскан: {title}")
+            candidates = []
+            scanned = 0
+            max_id_seen = last_id
+            scan_limit = bs.config.get("scan_limit", 1000)
+
+            chan_idx = channels_processed + 1
+            await update_progress(chan_idx, title, "📥 Скачиваю сообщения...", 0, 0, force=True)
+
+            async for msg in bs.user_client.iter_messages(entity, limit=scan_limit, min_id=last_id):
+                scanned += 1
+                max_id_seen = max(max_id_seen, msg.id)
+                text = msg.message or ""
+                text = fix_mojibake(text)
+                if text_matches(text, bs.patterns):
+                    candidates.append({
+                        "id": msg.id,
+                        "date": msg.date.isoformat() if msg.date else None,
+                        "text": text,
+                        "sender_id": msg.sender_id,
+                        "channel": channel,
+                        "channel_title": title
+                    })
+                if scanned % 25 == 0:
+                    await update_progress(chan_idx, title, f"📥 Сканирую: {scanned} сообщ. | кандидатов: {len(candidates)}", scanned, 0)
+
+            chan_new_leads = 0
+            if candidates:
+                total_candidates = len(candidates)
+                await update_progress(chan_idx, title, f"🤖 Классифицирую: 0/{total_candidates} | +0 лидов", scanned, 0, force=True)
+                for i, m in enumerate(candidates):
+                    if bs.stop_scan:
+                        break
+                    if bs.is_lead_known(m["id"]):
+                        continue
+                    result = await asyncio.to_thread(classify_message, bs.gemini, m["text"])
+                    cat = result["category"]
+                    bs.add_stat(cat)
+                    total_gemini += 1
+                    if result["is_lead"]:
+                        m["category"] = cat
+                        m["status"] = "new"
+                        m["reason"] = result["reason"]
+                        m["classified_at"] = datetime.now(timezone.utc).isoformat()
+                        bs.add_lead(m)
+                        await send_notification(m)
+                        total_new += 1
+                        chan_new_leads += 1
+
+                    await update_progress(
+                        chan_idx, title,
+                        f"🤖 Классифицирую: {i+1}/{total_candidates} | +{chan_new_leads} лидов",
+                        scanned, chan_new_leads
+                    )
+                    await asyncio.sleep(8.0)
+
+            bs.state[channel] = {
+                "last_id": max_id_seen,
+                "last_scan_at": datetime.now(timezone.utc).isoformat(),
+                "first_scan_at": chan_state.get("first_scan_at", datetime.now(timezone.utc).isoformat())
+            }
+            save_state(bs.state)
+            channels_processed += 1
+            total_scanned += scanned
+            await update_progress(chan_idx, title, f"✅ Готово (+{chan_new_leads} лидов, {scanned} сообщ.)", 0, chan_new_leads, force=True)
+        except Exception as e:
+            log.error(f"Автоскан error {channel}: {e}")
+
+    if slow_channels and not bs.stop_scan:
+        for channel in slow_channels:
+            if bs.stop_scan:
+                break
+            try:
+                entity = await bs.user_client.get_entity(channel)
+                title = getattr(entity, "title", channel)
+                chan_state = bs.state.get(channel, {})
+                last_id = chan_state.get("last_id", 0)
+                initial_days = bs.config.get("initial_scan_days", 60)
+                min_date = datetime.now(timezone.utc) - timedelta(days=initial_days)
+                log.info(f"🐢 Автоскан: {title} (первичный)")
+                candidates = []
+                scanned = 0
+                max_id_seen = last_id
+                scan_limit = bs.config.get("scan_limit", 1000)
+
+                chan_idx = channels_processed + 1
+                await update_progress(chan_idx, title, "📥 Скачиваю сообщения (первичный)...", 0, 0, force=True)
+
+                async for msg in bs.user_client.iter_messages(entity, limit=scan_limit, min_id=last_id):
+                    if msg.date and msg.date < min_date:
+                        break
+                    scanned += 1
+                    max_id_seen = max(max_id_seen, msg.id)
+                    text = msg.message or ""
+                    text = fix_mojibake(text)
+                    if text_matches(text, bs.patterns):
+                        candidates.append({
+                            "id": msg.id,
+                            "date": msg.date.isoformat() if msg.date else None,
+                            "text": text,
+                            "sender_id": msg.sender_id,
+                            "channel": channel,
+                            "channel_title": title
+                        })
+                    if scanned % 25 == 0:
+                        await update_progress(chan_idx, title, f"📥 Сканирую: {scanned} сообщ. | кандидатов: {len(candidates)}", scanned, 0)
+
+                chan_new_leads = 0
+                if candidates:
+                    total_candidates = len(candidates)
+                    await update_progress(chan_idx, title, f"🤖 Классифицирую: 0/{total_candidates} | +0 лидов", scanned, 0, force=True)
+                    for i, m in enumerate(candidates):
+                        if bs.stop_scan:
+                            break
+                        if bs.is_lead_known(m["id"]):
+                            continue
+                        result = await asyncio.to_thread(classify_message, bs.gemini, m["text"])
+                        cat = result["category"]
+                        bs.add_stat(cat)
+                        total_gemini += 1
+                        if result["is_lead"]:
+                            m["category"] = cat
+                            m["status"] = "new"
+                            m["reason"] = result["reason"]
+                            m["classified_at"] = datetime.now(timezone.utc).isoformat()
+                            bs.add_lead(m)
+                            await send_notification(m)
+                            total_new += 1
+                            chan_new_leads += 1
+
+                        await update_progress(
+                            chan_idx, title,
+                            f"🤖 Классифицирую: {i+1}/{total_candidates} | +{chan_new_leads} лидов",
+                            scanned, chan_new_leads
+                        )
+                        await asyncio.sleep(8.0)
+
+                bs.state[channel] = {
+                    "last_id": max_id_seen,
+                    "last_scan_at": datetime.now(timezone.utc).isoformat(),
+                    "first_scan_at": datetime.now(timezone.utc).isoformat()
+                }
+                save_state(bs.state)
+                channels_processed += 1
+                total_scanned += scanned
+                await update_progress(chan_idx, title, f"✅ Готово (+{chan_new_leads} лидов, {scanned} сообщ.)", 0, chan_new_leads, force=True)
+                if not bs.stop_scan:
+                    await asyncio.sleep(30)
+            except Exception as e:
+                log.error(f"Автоскан error {channel}: {e}")
+
+    try:
+        elapsed = (datetime.now(timezone.utc) - scan_start_time).total_seconds()
+        mins = int(elapsed // 60)
+        secs = int(elapsed % 60)
+        fin_text = (
+            f"✅ *Автоскан завершён*\n\n"
+            f"⏱ Время: {mins}м {secs}с\n"
+            f"📡 Сообщений проверено: {total_scanned}\n"
+            f"📡 Каналов: {channels_processed}/{total_channels}\n"
+            f"🎯 Новых лидов: {total_new}\n"
+            f"🤖 Gemini: {total_gemini}/1500\n"
+            f"📁 Всего в базе: {len(bs.leads)}"
+        )
+        if progress_msg:
+            await progress_msg.edit(fin_text, parse_mode="md")
+        else:
+            await bot_client.send_message(int(notify_chat_id), fin_text, parse_mode="md")
+    except Exception as e:
+        log.error(f"Не удалось отправить финальное сообщение: {e}")
+
+    # Показать главное меню через 3 секунды
+    await asyncio.sleep(3)
+    try:
+        await send_main_menu(int(notify_chat_id))
+    except Exception as e:
+        log.warning(f"Не удалось показать меню после автоскана: {e}")
 
 
 async def main():
@@ -1193,6 +1547,9 @@ async def main():
         elif data == "scan_slow":
             await cmd_scan_execute(event, "slow")
             await event.answer()
+        elif data == "scan_hybrid":
+            await cmd_scan_execute(event, "hybrid")
+            await event.answer()
         elif data == "scan_stop":
             bs.stop_scan = True
             await event.answer("Останавливаю...", alert=True)
@@ -1214,6 +1571,12 @@ async def main():
         await bot_client.send_message(int(notify_chat_id), startup_text, parse_mode="md")
     except Exception as e:
         log.error(f"Не удалось отправить стартовое сообщение: {e}")
+
+    # Запускаем автоскан (первый запуск за день)
+    try:
+        asyncio.create_task(check_and_run_auto_scan())
+    except Exception as e:
+        log.error(f"Автоскан не запустился: {e}")
 
     await asyncio.gather(
         user_client.run_until_disconnected(),
